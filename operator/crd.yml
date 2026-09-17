@@ -1,0 +1,38 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: manageddatabases.demo.com.lazovskyi.tt
+spec:
+  group: demo.com.lazovskyi.tt
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["engine", "sizeGB"]
+              properties:
+                engine:
+                  type: string
+                sizeGB:
+                  type: integer
+            status:
+              type: object
+              properties:
+                id:
+                  type: string
+                state:
+                  type: string
+                endpoint:
+                  type: string
+  scope: Namespaced
+  names:
+    plural: manageddatabases
+    singular: manageddatabase
+    kind: ManagedDatabase
+    shortNames:
+      - mdb
