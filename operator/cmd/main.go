@@ -2,6 +2,7 @@ package main
 
 import (
 	"db-operator/controller"
+	"db-operator/thirdparty"
 	"log"
 	"os"
 	"path/filepath"
@@ -12,9 +13,10 @@ import (
 )
 
 const (
-	K8SGroup        = "tt.yagatito.com"
-	K8SVersion      = "v1alpha1"
-	K8SResourceName = "manageddatabases"
+	k8sGroup            = "tt.yagatito.com"
+	k8sVersion          = "v1alpha1"
+	k8sResourceName     = "manageddatabases"
+	provisioningBaseUrl = "http://localhost:8080"
 )
 
 func main() {
@@ -41,12 +43,13 @@ func run() error {
 		return err
 	}
 
-	operator := controller.NewKubeOperator(dynamicClient)
+	provClient := thirdparty.NewProvisionerClient(provisioningBaseUrl)
+	operator := controller.NewKubeOperator(dynamicClient, provClient)
 
 	operator.Watch(schema.GroupVersionResource{
-		Group:    K8SGroup,
-		Version:  K8SVersion,
-		Resource: K8SResourceName,
+		Group:    k8sGroup,
+		Version:  k8sVersion,
+		Resource: k8sResourceName,
 	})
 
 	return nil
