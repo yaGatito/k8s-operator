@@ -165,6 +165,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 					return fmt.Errorf("failed to write instruction to annotations: %w", err)
 				}
 
+				log.Printf("[Finalizer] UNKNOWN state was set to resource due-to error while creating DB: %s", err)
 				return nil
 
 			} else {
@@ -277,7 +278,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		}
 	}
 
-	log.Printf("[Reconcile] skip: %s", key)
+	log.Printf("[Reconcile] skip (already synced & protected): %s", key)
 	return nil
 }
 
