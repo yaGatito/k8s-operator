@@ -19,7 +19,8 @@ import (
 )
 
 const (
-	dbFinalizer = "manageddatabase.tt.yagatito.com/finalizer"
+	dbFinalizer  = "manageddatabase.tt.yagatito.com/finalizer"
+	dbAnnotation = "manageddatabase.tt.yagatito.com/annotation"
 
 	baseRateLimitingDelay = 1 * time.Second
 	maxRateLimitingDelay  = 600 * time.Second
@@ -137,20 +138,42 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		provRes, err := ko.dbProvClient.CreateDatabase(name, engine, int(sizeGB))
 
 		if err != nil {
+			// Retry
 			if errors.Is(err, thirdparty.ServiceUnavailableError) {
 				return fmt.Errorf("error creating DB: %w", err)
+			}
 
-			} else if errors.Is(err, thirdparty.ServiceUnavailableError) {
+			// Unknown ID: to be patched manually
+			if errors.Is(err, thirdparty.InternalServiceError) {
 				unstructured.SetNestedField(unstructObj.Object, UnknownState, "status", "state")
+
+				unstructObj, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to update id %s in status: %w", provRes.ID, err)
+				}
+
+				annotations := unstructObj.GetAnnotations()
+				if annotations == nil {
+					annotations = make(map[string]string)
+				}
+				annotations[dbAnnotation] =
+					"API returned 500. Check your cloud provider console. If the DB was created, patch resource status with the ID, otherwise update any spec field."
+				unstructObj.SetAnnotations(annotations)
+
+				_, err = ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), unstructObj, metav1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to write instruction to annotations: %w", err)
+				}
+
+				return nil
 
 			} else {
 				log.Printf("[Finalizer] Unexpected error received: %s", err)
 			}
-
-		} else {
-			unstructured.SetNestedField(unstructObj.Object, provRes.ID, "status", "id")
-			unstructured.SetNestedField(unstructObj.Object, provRes.State, "status", "state")
 		}
+
+		unstructured.SetNestedField(unstructObj.Object, provRes.ID, "status", "id")
+		unstructured.SetNestedField(unstructObj.Object, provRes.State, "status", "state")
 
 		_, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
 		if err != nil {
@@ -160,8 +183,8 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		return nil
 	}
 
-	// CASE: DB is in PROVISIONING state
-	if k8Sstate == ProvisioningState {
+	// CASE: DB is in PROVISIONING state or DB id was manually patched by user.
+	if k8Sstate == ProvisioningState || (dbID != "" && k8Sstate == UnknownState) {
 		log.Printf("[Reconcile] Checking status for DB ID %s...", dbID)
 
 		externalDB, err := ko.dbProvClient.GetDatabase(dbID)
