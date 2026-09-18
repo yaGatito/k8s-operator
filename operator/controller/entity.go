@@ -165,7 +165,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 					return fmt.Errorf("failed to write instruction to annotations: %w", err)
 				}
 
-				log.Printf("[Finalizer] UNKNOWN state was set to resource due-to error while creating DB: %s", err)
+				log.Printf("[Finalizer] UNKNOWN state was set to resource due-to internal server error while creating DB")
 				return nil
 
 			} else {
@@ -269,6 +269,25 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		}
 
 		if changed {
+			// Condition to inform about immutable field change attept
+			conditions, _, _ := unstructured.NestedSlice(unstructObj.Object, "status", "conditions")
+			if conditions == nil {
+				conditions = make([]any, 1)
+			}
+			conditions[0] = map[string]any{
+				"type":               "Ready",
+				"status":             "False",
+				"reason":             "FieldIsImmutable",
+				"message":            "The sizeGB field cannot be modified after database creation. Rolling back to the original value.",
+				"lastTransitionTime": time.Now().Format(time.RFC3339),
+			}
+			unstructured.SetNestedSlice(unstructObj.Object, conditions, "status", "conditions")
+			unstructObj, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to apply status.conditions: %w", err)
+			}
+
+			// Rollback
 			_, err = ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), unstructObj, metav1.UpdateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to rollback immutable spec fields: %w", err)

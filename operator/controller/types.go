@@ -26,9 +26,10 @@ type ManagedDatabaseSpec struct {
 }
 
 type ManagedDatabaseStatus struct {
-	ID       string `json:"id,omitempty"`
-	State    string `json:"state,omitempty"`
-	Endpoint string `json:"endpoint,omitempty"`
+	ID         string             `json:"id,omitempty"`
+	State      string             `json:"state,omitempty"`
+	Endpoint   string             `json:"endpoint,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 func (in *ManagedDatabase) DeepCopyObject() runtime.Object {
