@@ -3,9 +3,11 @@ package controller
 import (
 	"context"
 	"db-operator/thirdparty"
+	"errors"
 	"fmt"
 	"log"
-	"strings"
+	"net/http"
+	"slices"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,7 +15,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+)
+
+const (
+	dbFinalizer = "manageddatabase.tt.yagatito.com/finalizer"
 )
 
 type KubeOperator struct {
@@ -54,8 +61,8 @@ func (ko *KubeOperator) Watch(gvr schema.GroupVersionResource) error {
 		case watch.Added, watch.Modified:
 			ko.queue.Add(key)
 
-		case watch.Deleted:
-			ko.delete(unstructObj)
+		case watch.Error:
+			log.Printf("[Error] Watcher error received: %v", event.Object)
 		}
 	}
 	return nil
@@ -73,7 +80,7 @@ func (ko *KubeOperator) runWorker(gvr schema.GroupVersionResource) {
 		err := ko.reconcile(gvr, key)
 
 		if err != nil {
-			log.Printf("Error syncing %s: %v", key, err)
+			log.Printf("[Error] syncing failed %s: %v", key, err)
 			ko.queue.AddRateLimited(key)
 		} else {
 			ko.queue.Forget(key)
@@ -84,26 +91,39 @@ func (ko *KubeOperator) runWorker(gvr schema.GroupVersionResource) {
 }
 
 func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) error {
-	var namespace, name string
-	parts := strings.SplitN(key, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid key")
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("invalid key: %w", err)
 	}
-	namespace = parts[0]
-	name = parts[1]
 
 	unstructObj, err := ko.client.Resource(gvr).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
+		return fmt.Errorf("invalid resource format: %w", err)
+	}
+
+	// CASE: DB marked as to be deleted
+	if unstructObj.GetDeletionTimestamp() != nil {
+		return ko.handleFinalizer(gvr, namespace, name, unstructObj)
+	}
+
+	// CASE: DB is to be provisioned/ready
+	finalizers := unstructObj.GetFinalizers()
+	if !slices.Contains(finalizers, dbFinalizer) {
+		unstructObj.SetFinalizers(append(finalizers, dbFinalizer))
+		_, err = ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), unstructObj, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to add finalizer: %w", err)
+		}
 		return nil
 	}
 
 	engine, _, _ := unstructured.NestedString(unstructObj.Object, "spec", "engine")
 	sizeGB, _, _ := unstructured.NestedInt64(unstructObj.Object, "spec", "sizeGB")
 	state, _, _ := unstructured.NestedString(unstructObj.Object, "status", "state")
-	dbID, foundID, _ := unstructured.NestedString(unstructObj.Object, "status", "id")
+	dbID, _, _ := unstructured.NestedString(unstructObj.Object, "status", "id")
 
 	// CASE: DB is not created
-	if !foundID {
+	if dbID == "" {
 		log.Printf("[Reconcile] Creating external DB for %s...", name)
 		provRes, err := ko.dbProvClient.CreateDatabase(name, engine, int(sizeGB))
 		if err != nil {
@@ -115,10 +135,10 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 
 		_, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to apply new status: %w", err)
+			return fmt.Errorf("failed to update id %s in status: %w", provRes.ID, err)
 		}
 
-		ko.queue.AddAfter(key, 20*time.Second)
+		ko.queue.AddAfter(key, 10*time.Second)
 		return nil
 	}
 
@@ -132,8 +152,9 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		}
 
 		if externalDB.State != thirdparty.ReadyState {
-			log.Printf("[Reconcile] DB %s is still %s. Will check again in 20s.", name, externalDB.State)
-			ko.queue.AddAfter(key, 20*time.Second)
+			log.Printf("[Reconcile] DB %s is still %s. Will check again in 10s.", name, externalDB.State)
+
+			ko.queue.AddAfter(key, 10*time.Second)
 			return nil
 		}
 
@@ -141,16 +162,67 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		unstructured.SetNestedField(unstructObj.Object, externalDB.Endpoint, "status", "endpoint")
 
 		_, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to apply ready status: %w", err)
+		}
+
+		log.Println("[Reconcile] K8S DB state is updated! DONE")
+		return nil
 	}
 
+	log.Printf("[Reconcile] skip: %s", key)
 	return nil
 }
 
-func (ko *KubeOperator) delete(obj *unstructured.Unstructured) {
-	dbID, foundID, _ := unstructured.NestedString(obj.Object, "status", "id")
-	if foundID {
-		log.Printf("[DELETE] Removing external DB ID: %s", dbID)
-		_ = ko.dbProvClient.DeleteDatabase(dbID)
+func (ko *KubeOperator) handleFinalizer(gvr schema.GroupVersionResource, namespace, name string, obj *unstructured.Unstructured) error {
+	finalizers := obj.GetFinalizers()
+
+	if !slices.Contains(finalizers, dbFinalizer) {
+		return nil
 	}
+
+	dbID, _, _ := unstructured.NestedString(obj.Object, "status", "id")
+
+	if dbID != "" {
+		log.Printf("[Finalizer] Deleting external DB ID: %s for resource %s", dbID, name)
+
+		err := ko.dbProvClient.DeleteDatabase(dbID)
+		if err != nil {
+			provErr, asType := errors.AsType[*thirdparty.ProvResError](err)
+
+			if asType {
+				switch provErr.StatusCode {
+				case http.StatusNotFound:
+					log.Printf("[Finalizer] No such db. Finalizing...")
+				case http.StatusServiceUnavailable:
+					return err
+				default:
+					log.Printf("[Error] Unexpected error: %s", err)
+				}
+
+			} else {
+				log.Printf("[Finalizer] Provider error details -> Status: %d, Msg: %s\n", provErr.StatusCode, provErr.ErrorMessage)
+
+				return fmt.Errorf("provider rejected deletion: %w", provErr)
+			}
+
+		} else {
+			log.Printf("[Finalizer] External DB deleted successfully. Removing finalizer from K8s...")
+		}
+
+	} else {
+		log.Printf("[Finalizer] Finilizing resource not found in k8s with id %s", dbID)
+	}
+
+	finalizers = slices.DeleteFunc(finalizers, func(s string) bool {
+		return s == dbFinalizer
+	})
+	obj.SetFinalizers(finalizers)
+
+	_, err := ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), obj, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to remove finalizer: %w", err)
+	}
+
+	return nil
 }
