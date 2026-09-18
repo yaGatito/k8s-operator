@@ -12,6 +12,10 @@ import (
 
 const (
 	databasesPath = "databases"
+
+	ProvisioningState = "PROVISIONING"
+	FailedState       = "FAILED"
+	ReadyState        = "READY"
 )
 
 type DbProvisionerClient interface {
@@ -72,8 +76,6 @@ func (c *ProvClient) CreateDatabase(name, engine string, sizeGB int) (ProvRes, e
 		return ProvRes{}, err
 	}
 
-	fmt.Println(string(bytes))
-
 	if rawResp.StatusCode == http.StatusServiceUnavailable {
 		return ProvRes{}, fmt.Errorf("api unavailable (503)")
 	}
@@ -101,8 +103,6 @@ func (c *ProvClient) GetDatabase(id string) (ProvRes, error) {
 		return ProvRes{}, err
 	}
 
-	fmt.Println(string(bytes))
-
 	if rawResp.StatusCode == http.StatusServiceUnavailable {
 		return ProvRes{}, fmt.Errorf("api unavailable (503)")
 	}
@@ -129,18 +129,19 @@ func (c *ProvClient) DeleteDatabase(id string) error {
 	}
 	defer rawResp.Body.Close()
 
-	bytes, err := io.ReadAll(rawResp.Body)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(bytes))
-
 	if rawResp.StatusCode == http.StatusServiceUnavailable {
-		return fmt.Errorf("api unavailable (503)")
+		bytes, err := io.ReadAll(rawResp.Body)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("api unavailable (503); message: %s", string(bytes))
 	}
 	if rawResp.StatusCode != http.StatusNoContent && rawResp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("failed to delete, status: %d", rawResp.StatusCode)
+		bytes, err := io.ReadAll(rawResp.Body)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("failed to delete, status: %d; message: %s", rawResp.StatusCode, string(bytes))
 	}
 
 	return nil
