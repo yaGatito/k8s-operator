@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -46,6 +45,15 @@ type ProvRes struct {
 	Endpoint string `json:"endpoint,omitempty"`
 }
 
+type ProvResError struct {
+	ErrorMessage string `json:"error"`
+	StatusCode   int
+}
+
+func (r ProvResError) Error() string {
+	return r.ErrorMessage
+}
+
 func NewProvisionerClient(baseURL string) *ProvClient {
 	return &ProvClient{
 		BaseURL: baseURL,
@@ -67,26 +75,15 @@ func (c *ProvClient) CreateDatabase(name, engine string, sizeGB int) (ProvRes, e
 
 	rawResp, err := c.HTTPClient.Post(c.BaseURL+"/"+databasesPath, "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return ProvRes{}, err
+		return ProvRes{}, fmt.Errorf("failed to post db: %w", err)
 	}
 	defer rawResp.Body.Close()
 
-	bytes, err := io.ReadAll(rawResp.Body)
+	res, err := parseResponse(rawResp)
 	if err != nil {
 		return ProvRes{}, err
 	}
 
-	if rawResp.StatusCode == http.StatusServiceUnavailable {
-		return ProvRes{}, fmt.Errorf("api unavailable (503)")
-	}
-	if rawResp.StatusCode != http.StatusCreated {
-		return ProvRes{}, fmt.Errorf("failed to create, status: %d", rawResp.StatusCode)
-	}
-
-	var res ProvRes
-	if err := json.Unmarshal(bytes, &res); err != nil {
-		return ProvRes{}, err
-	}
 	return res, nil
 }
 
@@ -94,26 +91,15 @@ func (c *ProvClient) GetDatabase(id string) (ProvRes, error) {
 	path := strings.Join([]string{c.BaseURL, databasesPath, id}, "/")
 	rawResp, err := c.HTTPClient.Get(path)
 	if err != nil {
-		return ProvRes{}, err
+		return ProvRes{}, fmt.Errorf("failed to get db: %w", err)
 	}
 	defer rawResp.Body.Close()
 
-	bytes, err := io.ReadAll(rawResp.Body)
+	res, err := parseResponse(rawResp)
 	if err != nil {
 		return ProvRes{}, err
 	}
 
-	if rawResp.StatusCode == http.StatusServiceUnavailable {
-		return ProvRes{}, fmt.Errorf("api unavailable (503)")
-	}
-	if rawResp.StatusCode == http.StatusNotFound {
-		return ProvRes{}, fmt.Errorf("database %s not found", id)
-	}
-
-	var res ProvRes
-	if err := json.Unmarshal(bytes, &res); err != nil {
-		return ProvRes{}, err
-	}
 	return res, nil
 }
 
@@ -125,24 +111,37 @@ func (c *ProvClient) DeleteDatabase(id string) error {
 	}
 	rawResp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete db: %w", err)
 	}
 	defer rawResp.Body.Close()
 
-	if rawResp.StatusCode == http.StatusServiceUnavailable {
-		bytes, err := io.ReadAll(rawResp.Body)
+	_, err = parseResponse(rawResp)
+
+	return err
+}
+
+// parseResponse relies ONLY on these 2xx status codes: Ok, Created, NoContent.
+func parseResponse(resp *http.Response) (ProvRes, error) {
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+		var res ProvRes
+		err := json.NewDecoder(resp.Body).Decode(&res)
 		if err != nil {
-			return err
+			return ProvRes{}, fmt.Errorf("failed to parse response: %w", err)
 		}
-		return fmt.Errorf("api unavailable (503); message: %s", string(bytes))
-	}
-	if rawResp.StatusCode != http.StatusNoContent && rawResp.StatusCode != http.StatusNotFound {
-		bytes, err := io.ReadAll(rawResp.Body)
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("failed to delete, status: %d; message: %s", rawResp.StatusCode, string(bytes))
+		return res, nil
 	}
 
-	return nil
+	if resp.StatusCode == http.StatusNoContent {
+		return ProvRes{}, nil
+	}
+
+	var errRes ProvResError
+	err := json.NewDecoder(resp.Body).Decode(&errRes)
+	if err != nil {
+		return ProvRes{}, fmt.Errorf("failed to parse error response: %w", err)
+	}
+
+	errRes.StatusCode = resp.StatusCode
+
+	return ProvRes{}, &errRes
 }
