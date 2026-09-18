@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"slices"
 	"time"
 
@@ -21,6 +20,14 @@ import (
 
 const (
 	dbFinalizer = "manageddatabase.tt.yagatito.com/finalizer"
+
+	baseRateLimitingDelay = 1 * time.Second
+	maxRateLimitingDelay  = 600 * time.Second
+
+	ProvisioningState = "PROVISIONING"
+	FailedState       = "FAILED"
+	ReadyState        = "READY"
+	UnknownState      = "UNKNOWN"
 )
 
 type KubeOperator struct {
@@ -30,10 +37,12 @@ type KubeOperator struct {
 }
 
 func NewKubeOperator(client dynamic.Interface, dbProvClient thirdparty.DbProvisionerClient) *KubeOperator {
+	rateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](baseRateLimitingDelay, maxRateLimitingDelay)
+
 	return &KubeOperator{
 		client:       client,
 		dbProvClient: dbProvClient,
-		queue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		queue:        workqueue.NewTypedRateLimitingQueue(rateLimiter),
 	}
 }
 
@@ -123,36 +132,49 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 	dbID, _, _ := unstructured.NestedString(unstructObj.Object, "status", "id")
 
 	// CASE: DB is not created
-	if dbID == "" {
+	if dbID == "" && k8Sstate != UnknownState {
 		log.Printf("[Reconcile] Creating external DB for %s...", name)
 		provRes, err := ko.dbProvClient.CreateDatabase(name, engine, int(sizeGB))
-		if err != nil {
-			return fmt.Errorf("error creating DB: %w", err)
-		}
 
-		unstructured.SetNestedField(unstructObj.Object, provRes.ID, "status", "id")
-		unstructured.SetNestedField(unstructObj.Object, provRes.State, "status", "state")
+		if err != nil {
+			if errors.Is(err, thirdparty.ServiceUnavailableError) {
+				return fmt.Errorf("error creating DB: %w", err)
+
+			} else if errors.Is(err, thirdparty.ServiceUnavailableError) {
+				unstructured.SetNestedField(unstructObj.Object, UnknownState, "status", "state")
+
+			} else {
+				log.Printf("[Finalizer] Unexpected error received: %s", err)
+			}
+
+		} else {
+			unstructured.SetNestedField(unstructObj.Object, provRes.ID, "status", "id")
+			unstructured.SetNestedField(unstructObj.Object, provRes.State, "status", "state")
+		}
 
 		_, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to update id %s in status: %w", provRes.ID, err)
 		}
 
-		ko.queue.AddAfter(key, 10*time.Second)
 		return nil
 	}
 
 	// CASE: DB is in PROVISIONING state
-	if k8Sstate == thirdparty.ProvisioningState {
+	if k8Sstate == ProvisioningState {
 		log.Printf("[Reconcile] Checking status for DB ID %s...", dbID)
 
 		externalDB, err := ko.dbProvClient.GetDatabase(dbID)
 		if err != nil {
-			return fmt.Errorf("error retrieving DB: %w", err)
+			if errors.Is(err, thirdparty.ServiceUnavailableError) {
+				return fmt.Errorf("error retrieving DB: %w", err)
+			} else {
+				log.Printf("[Finalizer] Unexpected error received: %s", err)
+			}
 		}
 
 		// CASE: still PROVISIONING state
-		if externalDB.State == thirdparty.ProvisioningState {
+		if externalDB.State == ProvisioningState {
 			log.Printf("[Reconcile] DB %s is still %s. Will check again in 10s.", name, externalDB.State)
 
 			ko.queue.AddAfter(key, 10*time.Second)
@@ -160,8 +182,19 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		}
 
 		// CASE: FAILED state
-		if externalDB.State == thirdparty.FailedState {
-			log.Printf("[Reconcile] DB provisioning failed. Re-requesting..")
+		if externalDB.State == FailedState {
+			log.Printf("[Reconcile] DB provisioning failed. Deleting previous DB and re-requesting new one..")
+
+			err := ko.dbProvClient.DeleteDatabase(dbID)
+			if err != nil {
+				if errors.Is(err, thirdparty.ServiceUnavailableError) {
+					return fmt.Errorf("error deleting DB: %w", err)
+				} else {
+					log.Printf("[Finalizer] Unexpected error received: %s", err)
+				}
+			} else {
+				log.Printf("[Finalizer] External DB deleted successfully. Removing finalizer from K8s...")
+			}
 
 			unstructured.SetNestedField(unstructObj.Object, "", "status", "id")
 			unstructured.SetNestedField(unstructObj.Object, "", "status", "state")
@@ -174,7 +207,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 			return nil
 		}
 
-		unstructured.SetNestedField(unstructObj.Object, thirdparty.ReadyState, "status", "state")
+		unstructured.SetNestedField(unstructObj.Object, ReadyState, "status", "state")
 		unstructured.SetNestedField(unstructObj.Object, externalDB.Endpoint, "status", "endpoint")
 
 		_, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
@@ -182,8 +215,43 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 			return fmt.Errorf("failed to apply ready status: %w", err)
 		}
 
-		log.Println("[Reconcile] K8S DB state is updated! DONE")
+		log.Println("[Reconcile] K8S DB state is updated to READY! DONE")
 		return nil
+	}
+
+	// CASE: DB is in READY state, so SPEC modification of manifiest should NOT be applied
+	if k8Sstate == ReadyState {
+		externalDB, err := ko.dbProvClient.GetDatabase(dbID)
+		if err != nil {
+			if errors.Is(err, thirdparty.ServiceUnavailableError) {
+				return fmt.Errorf("error retrieving DB: %w", err)
+			} else {
+				log.Printf("[Finalizer] Unexpected error received: %s", err)
+			}
+		}
+
+		changed := false
+
+		if engine != externalDB.Engine {
+			log.Printf("[Spec Protection] Attempt to change engine from %s to %s. Rolling back.", externalDB.Engine, engine)
+			unstructured.SetNestedField(unstructObj.Object, externalDB.Engine, "spec", "engine")
+			changed = true
+		}
+
+		if sizeGB != int64(externalDB.SizeGB) {
+			log.Printf("[Spec Protection] Attempt to change sizeGB from %d to %d. Rolling back.", externalDB.SizeGB, sizeGB)
+			unstructured.SetNestedField(unstructObj.Object, int64(externalDB.SizeGB), "spec", "sizeGB")
+			changed = true
+		}
+
+		if changed {
+			_, err = ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), unstructObj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to rollback immutable spec fields: %w", err)
+			}
+
+			return nil
+		}
 	}
 
 	log.Printf("[Reconcile] skip: %s", key)
@@ -204,35 +272,20 @@ func (ko *KubeOperator) handleFinalizer(gvr schema.GroupVersionResource, namespa
 
 		err := ko.dbProvClient.DeleteDatabase(dbID)
 		if err != nil {
-			provErr, asType := errors.AsType[*thirdparty.ProvResError](err)
-
-			if asType {
-				switch provErr.StatusCode {
-				case http.StatusNotFound:
-					log.Printf("[Finalizer] No such db. Finalizing...")
-				case http.StatusServiceUnavailable:
-					return err
-				default:
-					log.Printf("[Error] Unexpected error: %s", err)
-				}
-
+			if errors.Is(err, thirdparty.ServiceUnavailableError) {
+				return fmt.Errorf("error deleting DB: %w", err)
 			} else {
-				log.Printf("[Finalizer] Provider error details -> Status: %d, Msg: %s\n", provErr.StatusCode, provErr.ErrorMessage)
-
-				return fmt.Errorf("provider rejected deletion: %w", provErr)
+				log.Printf("[Finalizer] Unexpected error received: %s", err)
 			}
-
 		} else {
 			log.Printf("[Finalizer] External DB deleted successfully. Removing finalizer from K8s...")
 		}
 
 	} else {
-		log.Printf("[Finalizer] Finilizing resource not found in k8s with id %s", dbID)
+		log.Printf("[Finalizer] Finilizing resource with id %s was not found in k8s", dbID)
 	}
 
-	finalizers = slices.DeleteFunc(finalizers, func(s string) bool {
-		return s == dbFinalizer
-	})
+	finalizers = slices.DeleteFunc(finalizers, func(s string) bool { return s == dbFinalizer })
 	obj.SetFinalizers(finalizers)
 
 	_, err := ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), obj, metav1.UpdateOptions{})

@@ -3,7 +3,9 @@ package thirdparty
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -11,10 +13,13 @@ import (
 
 const (
 	databasesPath = "databases"
+)
 
-	ProvisioningState = "PROVISIONING"
-	FailedState       = "FAILED"
-	ReadyState        = "READY"
+var (
+	BadRequestError         = errors.New("bad request")
+	NotFoundError           = errors.New("not found")
+	InternalServiceError    = errors.New("internal service error")
+	ServiceUnavailableError = errors.New("service is not available now, retry later")
 )
 
 type DbProvisionerClient interface {
@@ -43,15 +48,6 @@ type ProvRes struct {
 	SizeGB   int    `json:"sizeGB"`
 	State    string `json:"state"`
 	Endpoint string `json:"endpoint,omitempty"`
-}
-
-type ProvResError struct {
-	ErrorMessage string `json:"error"`
-	StatusCode   int
-}
-
-func (r ProvResError) Error() string {
-	return r.ErrorMessage
 }
 
 func NewProvisionerClient(baseURL string) *ProvClient {
@@ -115,33 +111,52 @@ func (c *ProvClient) DeleteDatabase(id string) error {
 	}
 	defer rawResp.Body.Close()
 
+	// bail-check to prevent producing error on not found scenario
+	if rawResp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
 	_, err = parseResponse(rawResp)
 
 	return err
 }
 
-// parseResponse relies ONLY on these 2xx status codes: Ok, Created, NoContent.
+// parseResponse relies ONLY on these 2xx status codes: Ok, Created, NoContent. Any other cases produce errors.
 func parseResponse(resp *http.Response) (ProvRes, error) {
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated:
 		var res ProvRes
 		err := json.NewDecoder(resp.Body).Decode(&res)
 		if err != nil {
 			return ProvRes{}, fmt.Errorf("failed to parse response: %w", err)
 		}
 		return res, nil
-	}
 
-	if resp.StatusCode == http.StatusNoContent {
+	case http.StatusNoContent:
 		return ProvRes{}, nil
+
+	case http.StatusBadRequest:
+		return ProvRes{}, BadRequestError
+
+	case http.StatusNotFound:
+		return ProvRes{}, NotFoundError
+
+	case http.StatusInternalServerError:
+		return ProvRes{}, InternalServiceError
+
+	case http.StatusServiceUnavailable:
+		return ProvRes{}, ServiceUnavailableError
+
+	default:
+		var msg map[string]interface{}
+
+		err := json.NewDecoder(resp.Body).Decode(&msg)
+		if err != nil {
+			return ProvRes{}, fmt.Errorf("failed to parse error response: %w", err)
+		}
+
+		log.Printf("[Provisioning Client] Unexpected error: %s", msg["error"])
+
+		return ProvRes{}, fmt.Errorf("Unexpected error: %s", msg["error"])
 	}
-
-	var errRes ProvResError
-	err := json.NewDecoder(resp.Body).Decode(&errRes)
-	if err != nil {
-		return ProvRes{}, fmt.Errorf("failed to parse error response: %w", err)
-	}
-
-	errRes.StatusCode = resp.StatusCode
-
-	return ProvRes{}, &errRes
 }
