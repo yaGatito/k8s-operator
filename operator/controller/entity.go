@@ -119,7 +119,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 
 	engine, _, _ := unstructured.NestedString(unstructObj.Object, "spec", "engine")
 	sizeGB, _, _ := unstructured.NestedInt64(unstructObj.Object, "spec", "sizeGB")
-	state, _, _ := unstructured.NestedString(unstructObj.Object, "status", "state")
+	k8Sstate, _, _ := unstructured.NestedString(unstructObj.Object, "status", "state")
 	dbID, _, _ := unstructured.NestedString(unstructObj.Object, "status", "id")
 
 	// CASE: DB is not created
@@ -143,7 +143,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 	}
 
 	// CASE: DB is in PROVISIONING state
-	if state == thirdparty.ProvisioningState {
+	if k8Sstate == thirdparty.ProvisioningState {
 		log.Printf("[Reconcile] Checking status for DB ID %s...", dbID)
 
 		externalDB, err := ko.dbProvClient.GetDatabase(dbID)
@@ -151,10 +151,26 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 			return fmt.Errorf("error retrieving DB: %w", err)
 		}
 
-		if externalDB.State != thirdparty.ReadyState {
+		// CASE: still PROVISIONING state
+		if externalDB.State == thirdparty.ProvisioningState {
 			log.Printf("[Reconcile] DB %s is still %s. Will check again in 10s.", name, externalDB.State)
 
 			ko.queue.AddAfter(key, 10*time.Second)
+			return nil
+		}
+
+		// CASE: FAILED state
+		if externalDB.State == thirdparty.FailedState {
+			log.Printf("[Reconcile] DB provisioning failed. Re-requesting..")
+
+			unstructured.SetNestedField(unstructObj.Object, "", "status", "id")
+			unstructured.SetNestedField(unstructObj.Object, "", "status", "state")
+
+			_, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to re-request DB: %w", err)
+			}
+
 			return nil
 		}
 
