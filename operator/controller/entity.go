@@ -90,6 +90,7 @@ func (ko *KubeOperator) runWorker(gvr schema.GroupVersionResource) {
 		err := ko.reconcile(gvr, key)
 
 		if err != nil {
+			// Retry
 			log.Printf("[Error] syncing failed %s: %v", key, err)
 			ko.queue.AddRateLimited(key)
 		} else {
@@ -138,7 +139,6 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		provRes, err := ko.dbProvClient.CreateDatabase(name, engine, int(sizeGB))
 
 		if err != nil {
-			// Retry
 			if errors.Is(err, thirdparty.ServiceUnavailableError) {
 				return fmt.Errorf("error creating DB: %w", err)
 			}
