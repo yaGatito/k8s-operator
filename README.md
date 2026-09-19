@@ -13,7 +13,7 @@ cd operator && go run cmd/main.go
 kubectl apply -f crd.yml
 ```
 
-### Apply CR schema:
+### Apply CR manifest:
 ```sh
 kubectl apply -f - <<'EOF'
 apiVersion: tt.yagatito.com/v1alpha1
@@ -26,24 +26,31 @@ spec:
 EOF
 ```
 
-### Get CR schema:
+### Get CR manifest:
 ```sh
 kubectl get manageddatabase.tt.yagatito.com
 ```
 
-### Describe CR schema:
+### Describe CR manifest:
 ```sh
 kubectl describe manageddatabases.tt.yagatito.com orders
 ```
-### Delete CR schema:
+### Delete CR manifest:
 ```sh
 kubectl delete manageddatabases.tt.yagatito.com orders
 ```
 
-### Patch CR schema with ID:
+### Patch CR `status.id`:
 ```sh
 kubectl patch manageddatabases.tt.yagatito.com orders \
   --subresource=status \
   --type=merge \
   -p '{"status":{"id":"db-b0cf16a6"}}'
+```
+
+### Edit CR `spec.sizeGB`:
+```sh
+kubectl patch manageddatabases.tt.yagatito.com orders \
+  --type=merge \
+  -p '{"spec":{"sizeGB":10}}'
 ```

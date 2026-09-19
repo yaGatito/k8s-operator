@@ -24,6 +24,7 @@ const (
 
 	baseRateLimitingDelay = 1 * time.Second
 	maxRateLimitingDelay  = 600 * time.Second
+	pollingInterval       = 10 * time.Second
 
 	ProvisioningState = "PROVISIONING"
 	FailedState       = "FAILED"
@@ -65,7 +66,10 @@ func (ko *KubeOperator) Watch(gvr schema.GroupVersionResource) error {
 			continue
 		}
 
-		key := fmt.Sprintf("%s/%s", unstructObj.GetNamespace(), unstructObj.GetName())
+		key, err := cache.MetaNamespaceKeyFunc(unstructObj)
+		if err != nil {
+			return err
+		}
 
 		switch event.Type {
 		case watch.Added, watch.Modified:
@@ -99,6 +103,13 @@ func (ko *KubeOperator) runWorker(gvr schema.GroupVersionResource) {
 
 		ko.queue.Done(key)
 	}
+}
+
+type KubeParams struct {
+	gvr       schema.GroupVersionResource
+	namespace string
+	name      string
+	obj       *unstructured.Unstructured
 }
 
 func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) error {
@@ -201,7 +212,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 		if externalDB.State == ProvisioningState {
 			log.Printf("[Reconcile] DB %s is still %s. Will check again in 10s.", name, externalDB.State)
 
-			ko.queue.AddAfter(key, 10*time.Second)
+			ko.queue.AddAfter(key, pollingInterval)
 			return nil
 		}
 
@@ -268,37 +279,57 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 			changed = true
 		}
 
+		// Rollback
+		unstructObj, err = ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), unstructObj, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to rollback immutable spec fields: %w", err)
+		}
+
 		if changed {
 			// Condition to inform about immutable field change attept
-			conditions, _, _ := unstructured.NestedSlice(unstructObj.Object, "status", "conditions")
-			if conditions == nil {
-				conditions = make([]any, 1)
-			}
-			conditions[0] = map[string]any{
+			condition := map[string]any{
 				"type":               "Ready",
 				"status":             "False",
 				"reason":             "FieldIsImmutable",
 				"message":            "The sizeGB field cannot be modified after database creation. Rolling back to the original value.",
 				"lastTransitionTime": time.Now().Format(time.RFC3339),
 			}
-			unstructured.SetNestedSlice(unstructObj.Object, conditions, "status", "conditions")
-			unstructObj, err = ko.client.Resource(gvr).Namespace(namespace).UpdateStatus(context.Background(), unstructObj, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to apply status.conditions: %w", err)
-			}
 
-			// Rollback
-			_, err = ko.client.Resource(gvr).Namespace(namespace).Update(context.Background(), unstructObj, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to rollback immutable spec fields: %w", err)
-			}
-
-			return nil
+			_, err = ko.addCondition(KubeParams{
+				gvr:       gvr,
+				namespace: namespace,
+				name:      name,
+				obj:       unstructObj,
+			}, condition)
 		}
+
+		return nil
 	}
 
 	log.Printf("[Reconcile] skip (already synced & protected): %s", key)
 	return nil
+}
+
+func (ko *KubeOperator) addCondition(args KubeParams, cond map[string]any) (*unstructured.Unstructured, error) {
+	conditions, _, _ := unstructured.NestedSlice(args.obj.Object, "status", "conditions")
+	if conditions == nil {
+		conditions = make([]any, 1)
+		conditions[0] = cond
+	} else {
+		conditions = append(conditions, cond)
+	}
+
+	err := unstructured.SetNestedSlice(args.obj.Object, conditions, "status", "conditions")
+	if err != nil {
+		return nil, fmt.Errorf("failed to set status.conditions: %w", err)
+	}
+
+	args.obj, err = ko.client.Resource(args.gvr).Namespace(args.namespace).UpdateStatus(context.Background(), args.obj, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply status.conditions: %w", err)
+	}
+
+	return args.obj, nil
 }
 
 func (ko *KubeOperator) handleFinalizer(gvr schema.GroupVersionResource, namespace, name string, obj *unstructured.Unstructured) error {

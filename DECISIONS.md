@@ -26,5 +26,5 @@ Then the worker should catch this update and handle it in a common way.
 <br>
 
 ### E. What did you deliberately leave out, and what would you do next?
-**ANSWER:** At first, remove the informing annotation after the manual patch was applied (after the internal service error from the provider API). And after all, `entity.go` file needs some refactoring on which I don't have time, currently.
+**ANSWER:** At first, remove the informing annotation after the manual patch was applied (after the internal service error from the provider API). And after all, `entity.go` file needs some refactoring on which I don't have time, currently. And there is also should be rewrite condition mechanism.
 <br>
