@@ -62,6 +62,7 @@ func NewKubeOperator(
 	}
 }
 
+// Watch starts a live watcher on the given GVR and dispatches events to the worker queue.
 func (ko *KubeOperator) Watch(gvr schema.GroupVersionResource) error {
 	watcher, err := ko.client.Resource(gvr).Watch(context.Background(), metav1.ListOptions{})
 	if err != nil {
@@ -96,6 +97,7 @@ func (ko *KubeOperator) Watch(gvr schema.GroupVersionResource) error {
 	return nil
 }
 
+// runWorker drains the queue and calls reconcile for each key. Errors are retried via rate-limited requeue.
 func (ko *KubeOperator) runWorker(gvr schema.GroupVersionResource) {
 	defer ko.queue.ShutDown()
 
@@ -119,6 +121,8 @@ func (ko *KubeOperator) runWorker(gvr schema.GroupVersionResource) {
 	}
 }
 
+// reconcile is the core state-machine driver. It transitions resources through
+// UNKNOWN -> PROVISIONING -> READY/FAILED, or handles deletion via finalizers.
 func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -202,6 +206,7 @@ func (ko *KubeOperator) reconcile(gvr schema.GroupVersionResource, key string) e
 	return nil
 }
 
+// handleInitDbState calls the provisioner to create a DB and writes back the result ID/state.
 func (ko *KubeOperator) handleInitDbState(args kubeParams) error {
 	engine, _, err := unstructured.NestedString(args.obj.Object, "spec", "engine")
 	if err != nil {
@@ -272,6 +277,9 @@ func (ko *KubeOperator) handleInitDbState(args kubeParams) error {
 	return nil
 }
 
+// handleProvisionedDbState polls the provisioner until the DB is READY or FAILED.
+// On success it writes endpoint & state.
+// On failure it cleans up and resets status and produces error to trigger retry;
 func (ko *KubeOperator) handleProvisionedDbState(args kubeParams, databaseID string) error {
 	log.Printf("[Reconcile] Checking status for DB ID %s...", databaseID)
 
@@ -347,6 +355,8 @@ func (ko *KubeOperator) handleProvisionedDbState(args kubeParams, databaseID str
 	return nil
 }
 
+// handleReadyDbState enforces spec immutability after creation, rolling back any changes
+// and adding a status condition if a rollback occurred.
 func (ko *KubeOperator) handleReadyDbState(args kubeParams, databaseID string) error {
 	engine, _, err := unstructured.NestedString(args.obj.Object, "spec", "engine")
 	if err != nil {
@@ -412,6 +422,7 @@ func (ko *KubeOperator) handleReadyDbState(args kubeParams, databaseID string) e
 	return nil
 }
 
+// addCondition appends a status condition to the resource and persists it to K8s.
 func (ko *KubeOperator) addCondition(args kubeParams, cond map[string]any) (*unstructured.Unstructured, error) {
 	conditions, _, _ := unstructured.NestedSlice(args.obj.Object, "status", "conditions")
 	if conditions == nil {
@@ -434,6 +445,8 @@ func (ko *KubeOperator) addCondition(args kubeParams, cond map[string]any) (*uns
 	return args.obj, nil
 }
 
+// handleFinalizer cleans up the external DB when the K8s resource is deleted
+// (detected via DeletionTimestamp) and removes the managed finalizer.
 func (ko *KubeOperator) handleFinalizer(args kubeParams) error {
 	finalizers := args.obj.GetFinalizers()
 
