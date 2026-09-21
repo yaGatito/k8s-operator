@@ -1,0 +1,50 @@
+version: "2"
+
+run:
+  tests: false
+  relative-path-mode: gomod
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - rowserrcheck
+    - gocyclo
+    - gocritic
+    - misspell
+    - lll
+    - whitespace
+    - unparam
+    - gosec
+    - nilnesserr
+    - sqlclosecheck
+    - loggercheck
+    - testpackage
+    - unconvert
+    - gochecknoinits
+    - gomoddirectives
+    - testableexamples
+    - nakedret
+    - asciicheck
+
+  settings:
+    lll:
+      line-length: 150
+
+    whitespace:
+      multi-if: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - golines
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
