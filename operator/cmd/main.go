@@ -46,11 +46,14 @@ func run() error {
 	provClient := thirdparty.NewProvisionerClient(provisioningBaseUrl)
 	operator := controller.NewKubeOperator(dynamicClient, provClient)
 
-	operator.Watch(schema.GroupVersionResource{
+	err = operator.Watch(schema.GroupVersionResource{
 		Group:    k8sGroup,
 		Version:  k8sVersion,
 		Resource: k8sResourceName,
 	})
+	if err != nil {
+		return err
+	}
 
 	return nil
 }

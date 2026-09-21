@@ -16,10 +16,10 @@ const (
 )
 
 var (
-	BadRequestError         = errors.New("bad request")
-	NotFoundError           = errors.New("not found")
-	InternalServiceError    = errors.New("internal service error")
-	ServiceUnavailableError = errors.New("service is not available now, retry later")
+	ErrBadRequest         = errors.New("bad request")
+	ErrNotFound           = errors.New("not found")
+	ErrInternalService    = errors.New("internal service error")
+	ErrServiceUnavailable = errors.New("service is not available now, retry later")
 )
 
 type DbProvisionerClient interface {
@@ -69,11 +69,20 @@ func (c *ProvClient) CreateDatabase(name, engine string, sizeGB int) (ProvRes, e
 		return ProvRes{}, err
 	}
 
-	rawResp, err := c.HTTPClient.Post(c.BaseURL+"/"+databasesPath, "application/json", bytes.NewBuffer(reqBody))
+	rawResp, err := c.HTTPClient.Post(
+		c.BaseURL+"/"+databasesPath,
+		"application/json",
+		bytes.NewBuffer(reqBody),
+	)
 	if err != nil {
 		return ProvRes{}, fmt.Errorf("failed to post db: %w", err)
 	}
-	defer rawResp.Body.Close()
+	defer func() {
+		err := rawResp.Body.Close()
+		if err != nil {
+			log.Printf("failed to close response body: %s", err)
+		}
+	}()
 
 	res, err := parseResponse(rawResp)
 	if err != nil {
@@ -89,7 +98,12 @@ func (c *ProvClient) GetDatabase(id string) (ProvRes, error) {
 	if err != nil {
 		return ProvRes{}, fmt.Errorf("failed to get db: %w", err)
 	}
-	defer rawResp.Body.Close()
+	defer func() {
+		err := rawResp.Body.Close()
+		if err != nil {
+			log.Printf("failed to close response body: %s", err)
+		}
+	}()
 
 	res, err := parseResponse(rawResp)
 	if err != nil {
@@ -109,7 +123,12 @@ func (c *ProvClient) DeleteDatabase(id string) error {
 	if err != nil {
 		return fmt.Errorf("failed to delete db: %w", err)
 	}
-	defer rawResp.Body.Close()
+	defer func() {
+		err := rawResp.Body.Close()
+		if err != nil {
+			log.Printf("failed to close response body: %s", err)
+		}
+	}()
 
 	// bail-check to prevent producing error on not found scenario
 	if rawResp.StatusCode == http.StatusNotFound {
@@ -136,19 +155,19 @@ func parseResponse(resp *http.Response) (ProvRes, error) {
 		return ProvRes{}, nil
 
 	case http.StatusBadRequest:
-		return ProvRes{}, BadRequestError
+		return ProvRes{}, ErrBadRequest
 
 	case http.StatusNotFound:
-		return ProvRes{}, NotFoundError
+		return ProvRes{}, ErrNotFound
 
 	case http.StatusInternalServerError:
-		return ProvRes{}, InternalServiceError
+		return ProvRes{}, ErrInternalService
 
 	case http.StatusServiceUnavailable:
-		return ProvRes{}, ServiceUnavailableError
+		return ProvRes{}, ErrServiceUnavailable
 
 	default:
-		var msg map[string]interface{}
+		var msg map[string]any
 
 		err := json.NewDecoder(resp.Body).Decode(&msg)
 		if err != nil {
@@ -157,6 +176,6 @@ func parseResponse(resp *http.Response) (ProvRes, error) {
 
 		log.Printf("[Provisioning Client] Unexpected error: %s", msg["error"])
 
-		return ProvRes{}, fmt.Errorf("Unexpected error: %s", msg["error"])
+		return ProvRes{}, fmt.Errorf("unexpected error: %s", msg["error"])
 	}
 }
